@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+paired_data/*_note_counts.json
+paired_data/**/_note_cache.npz
+
+# raw/derived datasets and model artifacts - large, regenerable, not source
+maestro-v3.0.0.zip
+raw_midi/
+paired_data/
+checkpoints/
+renders/
