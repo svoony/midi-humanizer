@@ -131,28 +131,70 @@
   .trackLabel { font-size: 12px; font-weight: 600; color: #888; margin: 1.25rem 0 4px; text-transform: uppercase; letter-spacing: 0.04em; }
   #normalizedResult { display: none; margin-top: 0.5rem; }
 
-  .pedalPlayer {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    background: #f4f4f7;
-    border-radius: 24px;
-    padding: 8px 16px;
-  }
-  .pedalPlayer button {
-    width: 28px;
-    height: 28px;
-    border: none;
-    border-radius: 50%;
-    background: #222;
-    color: #fff;
-    cursor: pointer;
-    font-size: 12px;
-    flex-shrink: 0;
-  }
-  .pedalPlayer .time { font-size: 13px; color: #555; font-family: ui-monospace, monospace; white-space: nowrap; }
-  .pedalPlayer input[type="range"] { flex: 1; }
   .pedalNote { font-size: 11px; color: #888; margin-top: 6px; }
+
+  #libraryToggle {
+    background: none;
+    border: none;
+    color: #5a67d8;
+    font-size: 13px;
+    cursor: pointer;
+    padding: 0;
+    margin-bottom: 0.75rem;
+  }
+  #libraryToggle:hover { text-decoration: underline; }
+
+  #libraryPanel {
+    display: none;
+    border: 1px solid #e3e3e8;
+    border-radius: 10px;
+    padding: 12px;
+    margin-bottom: 1.25rem;
+  }
+  #libraryPanel.open { display: block; }
+  #librarySearch {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px 10px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font-size: 14px;
+  }
+  #libraryResults {
+    list-style: none;
+    margin: 10px 0 0;
+    padding: 0;
+    max-height: 280px;
+    overflow-y: auto;
+  }
+  #libraryResults li {
+    padding: 8px 6px;
+    cursor: pointer;
+    border-radius: 6px;
+    font-size: 13px;
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  #libraryResults li:hover { background: #f5f6ff; }
+  #libraryResults .libComposer { font-weight: 600; color: #333; }
+  #libraryResults .libTitle { color: #555; flex: 1; }
+  #libraryResults .libSource { font-size: 11px; color: #999; text-transform: uppercase; letter-spacing: 0.03em; flex-shrink: 0; }
+  #libraryResults .libEra {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 10px;
+    flex-shrink: 0;
+    align-self: center;
+  }
+  .era-baroque  { background: #f3e9d2; color: #8a6d3b; }
+  .era-classical { background: #e1ecf2; color: #31708f; }
+  .era-romantic { background: #f5e1e1; color: #a94442; }
+  .era-modern   { background: #e2efe1; color: #3c763d; }
+  #libraryEmpty { font-size: 13px; color: #888; padding: 8px 6px; }
 </style>
 </head>
 <body>
@@ -163,6 +205,12 @@
 <div class="controls">
   <label for="eraSelect">Style era</label>
   <select id="eraSelect"></select>
+</div>
+
+<button id="libraryToggle" type="button">Browse library (ASAP / KernScores)</button>
+<div id="libraryPanel">
+  <input type="text" id="librarySearch" placeholder="Search by composer or title (e.g. \"beethoven sonata\")">
+  <ul id="libraryResults"></ul>
 </div>
 
 <div id="dropzone">
@@ -180,13 +228,9 @@
 
 <div id="result">
   <div class="trackLabel">AI rendered (after)</div>
-  <div class="pedalPlayer">
-    <button id="playPauseBtn" aria-label="Play">&#9654;</button>
-    <span class="time"><span id="curTime">0:00</span> / <span id="totalTime">0:00</span></span>
-    <input type="range" id="seekSlider" min="0" max="1000" value="0">
-  </div>
-  <div class="pedalNote">Custom player with real sustain pedal audio (the standard MIDI player ignores pedal data)</div>
-  <a id="downloadLink" download="rendered.mid">Download rendered.mid</a>
+  <audio id="aiAudio" controls style="width:100%"></audio>
+  <div class="pedalNote">Rendered server-side through a real piano instrument (sustain pedal baked into the audio)</div>
+  <a id="downloadLink" download="rendered.wav">Download rendered.wav</a>
   <div id="paramSummary"></div>
 </div>
 
@@ -207,10 +251,7 @@ const filenameEl = document.getElementById('filename');
 const statusEl = document.getElementById('status');
 const resultEl = document.getElementById('result');
 const downloadLink = document.getElementById('downloadLink');
-const playPauseBtn = document.getElementById('playPauseBtn');
-const seekSlider = document.getElementById('seekSlider');
-const curTimeEl = document.getElementById('curTime');
-const totalTimeEl = document.getElementById('totalTime');
+const aiAudio = document.getElementById('aiAudio');
 const eraSelect = document.getElementById('eraSelect');
 const paramSummaryEl = document.getElementById('paramSummary');
 const chatSection = document.getElementById('chatSection');
@@ -220,212 +261,10 @@ const chatSend = document.getElementById('chatSend');
 const chatProgress = document.getElementById('chatProgress');
 const normalizedResultEl = document.getElementById('normalizedResult');
 const normalizedPlayer = document.getElementById('normalizedPlayer');
-
-const SOUND_FONT_URL = 'https://storage.googleapis.com/magentadata/js/soundfonts/sgm_plus';
-const SUSTAIN_CC_NUMBER = 64;
-const SUSTAIN_THRESHOLD = 64;
-const MAX_PEDAL_EXTENSION_SECONDS = 3;
-
-class PedalAwarePlayer {
-  constructor(soundFontURL) {
-    // Pedal extension means far more notes ring simultaneously than the
-    // soundfont engine expects (measured peaks of ~40 simultaneous voices
-    // vs. the ~10-15 a normal pedaled piano passage produces), so the
-    // summed signal clips. A real limiter wired directly into this
-    // player's own output (not a guessed volume on the shared master bus)
-    // catches this regardless of how many voices stack up.
-    this.limiter = new Tone.Limiter(-6).toDestination();
-    this.player = new core.SoundFontPlayer(soundFontURL, this.limiter);
-
-    this.noteSequence = null;
-    this.events = null;
-    this.timeoutIds = [];
-    this.activeNotes = new Set();
-    this.playStartContextTime = null;
-    this.pausedElapsed = 0;
-    this.playing = false;
-    this.onEnd = null;
-  }
-
-  async load(blob) {
-    this.stop();
-    this.noteSequence = await core.blobToNoteSequence(blob);
-    await this.player.loadSamples(this.noteSequence);
-    this.events = null;
-  }
-
-  get totalTime() {
-    return this.noteSequence ? this.noteSequence.totalTime : 0;
-  }
-
-  // Uses its own clock (Tone.now(), the raw audio-context time) instead of
-  // the shared Tone.Transport - <midi-player> (used for the flat track)
-  // also drives playback through Tone.Transport, so reading that singleton
-  // here meant this player's UI looked "playing" whenever the OTHER track
-  // played, even with no notes scheduled for this one.
-  get currentTime() {
-    if (this.playing) {
-      return Math.min(this.pausedElapsed + (Tone.now() - this.playStartContextTime), this.totalTime);
-    }
-    return this.pausedElapsed;
-  }
-
-  set currentTime(t) {
-    const wasPlaying = this.playing;
-    this._clearTimeouts();
-    this._releaseActiveNotes();
-    this.playing = false;
-    this.pausedElapsed = Math.max(0, Math.min(t, this.totalTime));
-    if (wasPlaying) this.play(this.onEnd);
-  }
-
-  get isPlaying() {
-    return this.playing;
-  }
-
-  _clearTimeouts() {
-    for (const id of this.timeoutIds) clearTimeout(id);
-    this.timeoutIds = [];
-  }
-
-  _buildEvents() {
-    const pedalEvents = (this.noteSequence.controlChanges || [])
-      .filter(cc => cc.controlNumber === SUSTAIN_CC_NUMBER)
-      .sort((a, b) => a.time - b.time);
-
-    const byPitch = {};
-    for (const note of this.noteSequence.notes) {
-      (byPitch[note.pitch] = byPitch[note.pitch] || []).push(note);
-    }
-    for (const pitch in byPitch) byPitch[pitch].sort((a, b) => a.startTime - b.startTime);
-
-    const nextSameStart = new Map();
-    for (const pitch in byPitch) {
-      const arr = byPitch[pitch];
-      for (let i = 0; i < arr.length - 1; i++) nextSameStart.set(arr[i], arr[i + 1].startTime);
-    }
-
-    const events = [];
-    for (const note of this.noteSequence.notes) {
-      let down = false;
-      let releaseAfter = null;
-      for (const cc of pedalEvents) {
-        if (cc.time <= note.endTime) {
-          down = cc.controlValue >= SUSTAIN_THRESHOLD;
-        } else if (down && releaseAfter === null && cc.controlValue < SUSTAIN_THRESHOLD) {
-          releaseAfter = cc.time;
-        }
-      }
-      let endTime = note.endTime;
-      if (down) {
-        endTime = releaseAfter !== null
-          ? Math.min(releaseAfter, note.endTime + MAX_PEDAL_EXTENSION_SECONDS)
-          : Math.min(this.noteSequence.totalTime, note.endTime + MAX_PEDAL_EXTENSION_SECONDS);
-      }
-      const nextStart = nextSameStart.get(note);
-      if (nextStart !== undefined) endTime = Math.min(endTime, nextStart);
-
-      events.push([note.startTime, { type: 'down', note }]);
-      events.push([endTime, { type: 'up', note }]);
-    }
-    return events;
-  }
-
-  play(onEnd) {
-    if (!this.noteSequence || this.playing) return;
-    if (onEnd) this.onEnd = onEnd;
-    if (!this.events) this.events = this._buildEvents();
-
-    this.playStartContextTime = Tone.now();
-    this.playing = true;
-    const offset = this.pausedElapsed;
-
-    for (const [time, ev] of this.events) {
-      const delay = (time - offset) * 1000;
-      if (delay < 0) continue;
-      this.timeoutIds.push(setTimeout(() => {
-        if (ev.type === 'down') {
-          this.player.playNoteDown(ev.note);
-          this.activeNotes.add(ev.note);
-        } else {
-          this.player.playNoteUp(ev.note);
-          this.activeNotes.delete(ev.note);
-        }
-      }, delay));
-    }
-
-    const endDelay = Math.max(0, (this.totalTime - offset) * 1000);
-    this.timeoutIds.push(setTimeout(() => {
-      this.playing = false;
-      this.pausedElapsed = 0;
-      this._clearTimeouts();
-      this._releaseActiveNotes();
-      if (this.onEnd) this.onEnd();
-    }, endDelay));
-  }
-
-  // Clearing a future "up" timeout (on pause/stop) only cancels the
-  // scheduled release - it never actually tells the synth to stop the
-  // note, so anything pedal-extended just kept ringing indefinitely.
-  // Force-release whatever's currently sounding instead.
-  _releaseActiveNotes() {
-    for (const note of this.activeNotes) this.player.playNoteUp(note);
-    this.activeNotes.clear();
-  }
-
-  pause() {
-    if (!this.playing) return;
-    this.pausedElapsed = this.currentTime;
-    this.playing = false;
-    this._clearTimeouts();
-    this._releaseActiveNotes();
-  }
-
-  stop() {
-    this._clearTimeouts();
-    this._releaseActiveNotes();
-    this.playing = false;
-    this.pausedElapsed = 0;
-  }
-}
-
-const aiPlayer = new PedalAwarePlayer(SOUND_FONT_URL);
-let seekDragging = false;
-
-function formatTime(s) {
-  s = Math.max(0, Math.floor(s));
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-}
-
-function refreshTransportUI() {
-  if (!aiPlayer.noteSequence) return;
-  totalTimeEl.textContent = formatTime(aiPlayer.totalTime);
-  if (!seekDragging) {
-    curTimeEl.textContent = formatTime(aiPlayer.currentTime);
-    seekSlider.value = aiPlayer.totalTime > 0 ? (aiPlayer.currentTime / aiPlayer.totalTime) * 1000 : 0;
-  }
-}
-setInterval(refreshTransportUI, 200);
-
-playPauseBtn.addEventListener('click', () => {
-  if (!aiPlayer.noteSequence) return;
-  if (aiPlayer.isPlaying) {
-    aiPlayer.pause();
-    playPauseBtn.innerHTML = '&#9654;';
-  } else {
-    aiPlayer.play(() => { playPauseBtn.innerHTML = '&#9654;'; });
-    playPauseBtn.innerHTML = '&#10074;&#10074;';
-  }
-});
-
-seekSlider.addEventListener('input', () => {
-  seekDragging = true;
-  curTimeEl.textContent = formatTime((seekSlider.value / 1000) * aiPlayer.totalTime);
-});
-seekSlider.addEventListener('change', () => {
-  aiPlayer.currentTime = (seekSlider.value / 1000) * aiPlayer.totalTime;
-  seekDragging = false;
-});
+const libraryToggle = document.getElementById('libraryToggle');
+const libraryPanel = document.getElementById('libraryPanel');
+const librarySearch = document.getElementById('librarySearch');
+const libraryResults = document.getElementById('libraryResults');
 
 let sessionId = null;
 let params = {};
@@ -445,6 +284,81 @@ eraSelect.addEventListener('change', () => {
   params.era = eraSelect.value;
   renderCurrent();
 });
+
+libraryToggle.addEventListener('click', () => {
+  libraryPanel.classList.toggle('open');
+  if (libraryPanel.classList.contains('open') && !libraryResults.dataset.loaded) {
+    runLibrarySearch('');
+  }
+});
+
+let librarySearchDebounce = null;
+librarySearch.addEventListener('input', () => {
+  clearTimeout(librarySearchDebounce);
+  librarySearchDebounce = setTimeout(() => runLibrarySearch(librarySearch.value), 250);
+});
+
+async function runLibrarySearch(query) {
+  libraryResults.dataset.loaded = '1';
+  try {
+    const res = await fetch('/library/search?q=' + encodeURIComponent(query));
+    const items = await safeJson(res, []);
+    renderLibraryResults(items);
+  } catch (e) {
+    libraryResults.innerHTML = `<li id="libraryEmpty">Network error: ${e.message}</li>`;
+  }
+}
+
+function renderLibraryResults(items) {
+  libraryResults.innerHTML = '';
+  if (!items.length) {
+    libraryResults.innerHTML = '<li id="libraryEmpty">No matches.</li>';
+    return;
+  }
+  for (const item of items) {
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="libComposer">${escapeHtml(item.composer)}</span> ` +
+      `<span class="libTitle">${escapeHtml(item.title)}</span>` +
+      `<span class="libEra era-${escapeHtml(item.era)}">${escapeHtml(item.era)}</span>` +
+      `<span class="libSource">${escapeHtml(item.source)}</span>`;
+    li.addEventListener('click', () => loadLibraryItem(item));
+    libraryResults.appendChild(li);
+  }
+}
+
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s || '';
+  return div.innerHTML;
+}
+
+async function loadLibraryItem(item) {
+  filenameEl.textContent = `${item.composer} - ${item.title} (${item.source})`;
+  resultEl.style.display = 'none';
+  chatSection.style.display = 'none';
+  chatLog.innerHTML = '';
+  setStatus('<span class="spinner"></span>Loading...');
+
+  try {
+    const res = await fetch('/library/load', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ library_id: item.id }),
+    });
+    const data = await safeJson(res);
+    if (!res.ok) {
+      setStatus(data.error || 'load failed', true);
+      return;
+    }
+    sessionId = data.session_id;
+    params = data.params;
+    eraSelect.value = params.era;
+    await Promise.all([renderCurrent(), fetchNormalized()]);
+    chatSection.style.display = 'block';
+  } catch (e) {
+    setStatus('Network error: ' + e.message, true);
+  }
+}
 
 dropzone.addEventListener('click', () => fileInput.click());
 dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
@@ -524,9 +438,7 @@ async function renderCurrent() {
     }
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
-    await aiPlayer.load(blob);
-    playPauseBtn.innerHTML = '&#9654;';
-    refreshTransportUI();
+    aiAudio.src = url;
     downloadLink.href = url;
     resultEl.style.display = 'block';
     updateParamSummary();

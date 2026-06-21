@@ -14,8 +14,10 @@ import traceback
 
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
+from audio_render import render_pm_to_wav_bytes
 from chat_control import DEFAULT_PARAMS, interpret_command
 from infer import apply_adjustments, normalize_to_flat_midi, predict_raw
+import library
 from note_dataset import ERA_NAMES
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,6 +50,28 @@ def index():
 @app.route("/eras")
 def eras():
     return jsonify(ERA_NAMES)
+
+
+@app.route("/library/search")
+def library_search():
+    query = request.args.get("q", "")
+    return jsonify(library.search(query))
+
+
+@app.route("/library/load", methods=["POST"])
+def library_load():
+    data = request.get_json(force=True)
+    entry = library.find(data.get("library_id"))
+    if entry is None:
+        return jsonify({"error": "unknown library item"}), 400
+
+    # Render the piece in its own era by default (e.g. a Bach piece loads as
+    # baroque, not the generic romantic default), matching the UI era tag.
+    params = dict(DEFAULT_PARAMS)
+    params["era"] = entry["era"]
+    session_id = secrets.token_hex(8)
+    SESSIONS[session_id] = {"file_path": entry["path"], "params": params, "raw_cache": {}}
+    return jsonify({"session_id": session_id, "params": params})
 
 
 @app.route("/upload", methods=["POST"])
@@ -103,13 +127,12 @@ def render_route():
     try:
         raw = _get_raw(session)
         out_pm = apply_adjustments(raw, session["params"])
+        wav_bytes = render_pm_to_wav_bytes(out_pm)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    buf = io.BytesIO()
-    out_pm.write(buf)
-    buf.seek(0)
-    return send_file(buf, mimetype="audio/midi", as_attachment=True, download_name="rendered.mid")
+    buf = io.BytesIO(wav_bytes)
+    return send_file(buf, mimetype="audio/wav", as_attachment=True, download_name="rendered.wav")
 
 
 @app.route("/chat", methods=["POST"])

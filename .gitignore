@@ -13,3 +13,6 @@ checkpoints/
 renders/
 _uploads/
 mxl_library/
+
+# vendored binaries - downloaded by setup, not source
+vendor/
