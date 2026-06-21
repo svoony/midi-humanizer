@@ -5,7 +5,11 @@ paired_data/**/_note_cache.npz
 
 # raw/derived datasets and model artifacts - large, regenerable, not source
 maestro-v3.0.0.zip
+mxl.tar.gz
+mxl/
 raw_midi/
 paired_data/
 checkpoints/
 renders/
+_uploads/
+mxl_library/
