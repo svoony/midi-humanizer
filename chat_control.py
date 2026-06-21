@@ -19,6 +19,9 @@ DEFAULT_PARAMS = {
     "pedal_boost": 0.0,           # flat additive pedal, -1..1, use positive to add pedal even if near zero
     "tempo_multiplier": 1.0,      # overall playback speed, 1 = normal, >1 = faster, <1 = slower
     "articulation_intensity": 1.0,  # 0 = no staccato/legato variation, 1 = normal, >1 = exaggerated
+    "melody_emphasis": 0.0,       # 0 = off, 1 = bring the melody clearly above accompaniment, 2 = strong
+    "chord_roll": 0.0,            # 0 = chords struck together, 1 = gentle bottom-to-top roll, 2 = harp-like
+    "metric_accent": 0.0,         # 0 = off, 1 = clear downbeat stress, 2 = strong
 }
 
 ADJUST_TOOL = {
@@ -64,6 +67,30 @@ ADJUST_TOOL = {
                 "articulation_intensity": {
                     "type": "number",
                     "description": "0=no staccato/legato variation, 1=normal, 2=very exaggerated",
+                },
+                "melody_emphasis": {
+                    "type": "number",
+                    "description": (
+                        "how much to bring out the melody (top voice) over the accompaniment: "
+                        "0=off/balanced, 1=melody clearly on top, 2=strongly highlighted. Use for "
+                        "requests like 'bring out the melody', 'highlight the tune', 'voice the top line'"
+                    ),
+                },
+                "chord_roll": {
+                    "type": "number",
+                    "description": (
+                        "arpeggiate/roll chords from bottom to top instead of striking them together: "
+                        "0=off, 1=gentle roll, 2=harp-like spread. Use for 'roll the chords', "
+                        "'arpeggiate', 'spread the chords', 'less blocky chords'"
+                    ),
+                },
+                "metric_accent": {
+                    "type": "number",
+                    "description": (
+                        "emphasize strong beats, especially downbeats: 0=off, 1=clear pulse, "
+                        "2=strong. Use for 'stronger beat', 'more pulse', 'emphasize the downbeat', "
+                        "'more rhythmic drive'"
+                    ),
                 },
                 "reply": {
                     "type": "string",

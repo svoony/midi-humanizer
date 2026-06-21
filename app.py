@@ -19,6 +19,7 @@ from chat_control import DEFAULT_PARAMS, interpret_command
 from infer import apply_adjustments, normalize_to_flat_midi, predict_raw
 import library
 from note_dataset import ERA_NAMES
+from style_presets import preset_for
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -65,10 +66,11 @@ def library_load():
     if entry is None:
         return jsonify({"error": "unknown library item"}), 400
 
-    # Render the piece in its own era by default (e.g. a Bach piece loads as
-    # baroque, not the generic romantic default), matching the UI era tag.
+    # Open the piece with musically-informed starting levers (its own era plus
+    # composer/piece-type-aware expressive settings) instead of flat defaults.
     params = dict(DEFAULT_PARAMS)
     params["era"] = entry["era"]
+    params.update(preset_for(entry["composer"], entry["era"], entry["title"]))
     session_id = secrets.token_hex(8)
     SESSIONS[session_id] = {"file_path": entry["path"], "params": params, "raw_cache": {}}
     return jsonify({"session_id": session_id, "params": params})
@@ -133,6 +135,29 @@ def render_route():
 
     buf = io.BytesIO(wav_bytes)
     return send_file(buf, mimetype="audio/wav", as_attachment=True, download_name="rendered.wav")
+
+
+@app.route("/render_midi", methods=["POST"])
+def render_midi_route():
+    """The same adjusted performance as /render, but as a downloadable .mid
+    (the symbolic performance before FluidSynth turns it into audio) - reuses
+    the cached raw predictions, so it's just the cheap post-processing pass."""
+    data = request.get_json(force=True)
+    session = SESSIONS.get(data.get("session_id"))
+    if session is None:
+        return jsonify({"error": "unknown session - upload a file first"}), 400
+    if not os.path.exists(session["file_path"]):
+        return jsonify({"error": "session expired (uploaded file is gone) - please re-upload"}), 400
+
+    try:
+        out_pm = apply_adjustments(_get_raw(session), session["params"])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    buf = io.BytesIO()
+    out_pm.write(buf)
+    buf.seek(0)
+    return send_file(buf, mimetype="audio/midi", as_attachment=True, download_name="rendered.mid")
 
 
 @app.route("/chat", methods=["POST"])

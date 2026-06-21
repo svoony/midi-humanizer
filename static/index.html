@@ -61,14 +61,16 @@
 
   #result { display: none; margin-top: 1.5rem; }
   midi-player { width: 100%; }
-  #downloadLink {
+  .downloadLink {
     display: inline-block;
     margin-top: 10px;
+    margin-right: 16px;
     font-size: 13px;
     color: #5a67d8;
     text-decoration: none;
+    cursor: pointer;
   }
-  #downloadLink:hover { text-decoration: underline; }
+  .downloadLink:hover { text-decoration: underline; }
 
   #paramSummary {
     font-size: 12px;
@@ -76,6 +78,28 @@
     margin-top: 10px;
     font-family: ui-monospace, monospace;
   }
+  #paramSummary .leverWord {
+    text-decoration: underline dotted;
+    text-underline-offset: 2px;
+    cursor: help;
+  }
+
+  #leverTooltip {
+    position: fixed;
+    z-index: 1000;
+    display: none;
+    max-width: 260px;
+    background: #2b2b3a;
+    color: #f5f5fa;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 12px;
+    line-height: 1.4;
+    padding: 8px 10px;
+    border-radius: 8px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+    pointer-events: none;
+  }
+  #leverTooltip .ltName { font-weight: 600; display: block; margin-bottom: 2px; }
 
   #chatSection { display: none; margin-top: 2rem; border-top: 1px solid #eee; padding-top: 1.25rem; }
   #chatSection h2 { font-size: 14px; font-weight: 600; margin: 0 0 0.75rem; color: #444; }
@@ -195,6 +219,15 @@
   .era-romantic { background: #f5e1e1; color: #a94442; }
   .era-modern   { background: #e2efe1; color: #3c763d; }
   #libraryEmpty { font-size: 13px; color: #888; padding: 8px 6px; }
+  #libraryAttribution {
+    font-size: 10px;
+    color: #aaa;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid #eee;
+    line-height: 1.5;
+  }
+  #libraryAttribution a { color: #8a93c8; }
 </style>
 </head>
 <body>
@@ -207,10 +240,15 @@
   <select id="eraSelect"></select>
 </div>
 
-<button id="libraryToggle" type="button">Browse library (ASAP / KernScores)</button>
+<button id="libraryToggle" type="button">Browse library (ASAP / KernScores / piano-midi.de)</button>
 <div id="libraryPanel">
   <input type="text" id="librarySearch" placeholder="Search by composer or title (e.g. \"beethoven sonata\")">
   <ul id="libraryResults"></ul>
+  <div id="libraryAttribution">
+    piano-midi.de tracks &copy; Bernd Krueger, used under
+    <a href="https://creativecommons.org/licenses/by-sa/3.0/de/deed.en" target="_blank" rel="noopener">CC BY-SA 3.0 DE</a>
+    &mdash; source: <a href="http://www.piano-midi.de" target="_blank" rel="noopener">piano-midi.de</a>
+  </div>
 </div>
 
 <div id="dropzone">
@@ -230,9 +268,14 @@
   <div class="trackLabel">AI rendered (after)</div>
   <audio id="aiAudio" controls style="width:100%"></audio>
   <div class="pedalNote">Rendered server-side through a real piano instrument (sustain pedal baked into the audio)</div>
-  <a id="downloadLink" download="rendered.wav">Download rendered.wav</a>
+  <div>
+    <a id="downloadLink" class="downloadLink" download="rendered.wav">Download WAV (audio)</a>
+    <a id="downloadMidiLink" class="downloadLink" href="#">Download MIDI (.mid)</a>
+  </div>
   <div id="paramSummary"></div>
 </div>
+
+<div id="leverTooltip"></div>
 
 <div id="chatSection">
   <h2>Adjust the performance</h2>
@@ -251,6 +294,8 @@ const filenameEl = document.getElementById('filename');
 const statusEl = document.getElementById('status');
 const resultEl = document.getElementById('result');
 const downloadLink = document.getElementById('downloadLink');
+const downloadMidiLink = document.getElementById('downloadMidiLink');
+const leverTooltip = document.getElementById('leverTooltip');
 const aiAudio = document.getElementById('aiAudio');
 const eraSelect = document.getElementById('eraSelect');
 const paramSummaryEl = document.getElementById('paramSummary');
@@ -448,12 +493,80 @@ async function renderCurrent() {
   }
 }
 
-function updateParamSummary() {
-  paramSummaryEl.textContent =
-    `era=${params.era}  rubato=${params.rubato_intensity}  dynamics=${params.dynamics_intensity}  ` +
-    `pedal=${params.pedal_scale}x+${params.pedal_boost}  tempo=${params.tempo_multiplier}x  ` +
-    `articulation=${params.articulation_intensity}`;
+const LEVER_DEFS = {
+  era: 'Stylistic period the performance is modeled in (baroque, classical, romantic, modern). This conditions the model itself, shaping its timing, dynamics, and pedaling.',
+  rubato: 'Expressive flexibility of timing — how much notes push and pull against a strict beat. 1 = the model’s natural feel, 0 = mechanical, higher = more exaggerated.',
+  dynamics: 'The spread between soft and loud. 1 = normal contrast, 0 = flat/even, higher = more dramatic swings.',
+  pedal: 'Sustain-pedal amount, shown as scale× + boost. Scale multiplies the predicted pedal (0 = dry, 1 = normal, higher = more blur); boost adds a flat amount.',
+  tempo: 'Overall playback speed multiplier. 1 = as written, >1 faster, <1 slower.',
+  articulation: 'How detached or connected notes are (staccato vs legato). 1 = normal, 0 = even, higher = more exaggerated.',
+  melody: 'Melody emphasis — how much the top voice is lifted above the accompaniment. 0 = balanced, higher = melody more prominent.',
+  roll: 'Chord roll — staggers chord notes bottom-to-top for an arpeggiated attack. 0 = struck together, higher = more spread.',
+  accent: 'Metric accent — emphasis on strong beats, especially downbeats. 0 = even, higher = stronger pulse.',
+};
+
+function leverSpan(word) {
+  return `<span class="leverWord" data-lever="${word}">${word}</span>`;
 }
+
+function updateParamSummary() {
+  paramSummaryEl.innerHTML =
+    `${leverSpan('era')}=${params.era}  ${leverSpan('rubato')}=${params.rubato_intensity}  ` +
+    `${leverSpan('dynamics')}=${params.dynamics_intensity}  ` +
+    `${leverSpan('pedal')}=${params.pedal_scale}x+${params.pedal_boost}  ` +
+    `${leverSpan('tempo')}=${params.tempo_multiplier}x  ` +
+    `${leverSpan('articulation')}=${params.articulation_intensity}  ` +
+    `${leverSpan('melody')}=${params.melody_emphasis}  ` +
+    `${leverSpan('roll')}=${params.chord_roll}  ${leverSpan('accent')}=${params.metric_accent}`;
+}
+
+// Cursor-following tooltip defining each lever word. Delegated on the summary
+// container so it keeps working after updateParamSummary rebuilds the spans.
+function positionLeverTooltip(e) {
+  const pad = 14;
+  let x = e.clientX + pad, y = e.clientY + pad;
+  const r = leverTooltip.getBoundingClientRect();
+  if (x + r.width > window.innerWidth - 8) x = e.clientX - pad - r.width;
+  if (y + r.height > window.innerHeight - 8) y = e.clientY - pad - r.height;
+  // keep fully on-screen even in narrow viewports (flip can overshoot)
+  x = Math.max(8, Math.min(x, window.innerWidth - r.width - 8));
+  y = Math.max(8, Math.min(y, window.innerHeight - r.height - 8));
+  leverTooltip.style.left = x + 'px';
+  leverTooltip.style.top = y + 'px';
+}
+paramSummaryEl.addEventListener('mousemove', (e) => {
+  const word = e.target.closest('.leverWord');
+  if (word) {
+    const key = word.dataset.lever;
+    leverTooltip.innerHTML = `<span class="ltName">${key}</span>${LEVER_DEFS[key] || ''}`;
+    leverTooltip.style.display = 'block';
+    positionLeverTooltip(e);
+  } else {
+    leverTooltip.style.display = 'none';
+  }
+});
+paramSummaryEl.addEventListener('mouseleave', () => { leverTooltip.style.display = 'none'; });
+
+downloadMidiLink.addEventListener('click', async (e) => {
+  e.preventDefault();
+  if (!sessionId) return;
+  try {
+    const res = await fetch('/render_midi', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    if (!res.ok) { setStatus('MIDI download failed', true); return; }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'rendered.mid';
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    setStatus('MIDI download error: ' + err.message, true);
+  }
+});
 
 async function sendChat() {
   const message = chatInput.value.trim();

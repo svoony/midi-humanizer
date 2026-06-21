@@ -41,6 +41,14 @@ MAX_TIMING_OFFSET_GRID_UNITS = 2.0
 MIN_LOG_RATIO, MAX_LOG_RATIO = np.log(0.1), np.log(10.0)
 SUSTAIN_CC = 64
 
+# scale factors mapping the 0..~2 user knobs to musically reasonable amounts
+# (velocity values are in the model's 0-1 space; *127 happens at the end)
+MELODY_EMPHASIS_TOP_GAIN = 0.20      # added to the top voice at emphasis=1
+MELODY_EMPHASIS_ACCOMP_CUT = 0.12    # removed from inner/bottom voices at emphasis=1
+METRIC_ACCENT_GAIN = 0.15            # added on a downbeat at accent=1
+METRIC_ACCENT_WEAK_BEAT = 0.45       # accent weight on non-downbeat beats, relative to a downbeat
+CHORD_ROLL_SECONDS_PER_NOTE = 0.018  # onset stagger per chord note (bottom->top) at roll=1
+
 _model_cache = {}
 
 
@@ -173,6 +181,7 @@ def predict_raw(input_path, era, checkpoint_path="checkpoints/best.pt", device=N
 
     n_total = len(pitches)
     out_q_starts, out_q_ends, out_timing, out_logratio, out_vel, out_pedal = [], [], [], [], [], []
+    out_beat_pos, out_beat_in_measure = [], []
 
     for chunk_start in range(0, n_total, WINDOW_NOTES):
         chunk_end = min(chunk_start + WINDOW_NOTES, n_total)
@@ -218,6 +227,8 @@ def predict_raw(input_path, era, checkpoint_path="checkpoints/best.pt", device=N
         out_logratio.append(pred[:, 1])
         out_vel.append(np.clip(pred[:, 2], 0.0, 1.0))
         out_pedal.append(np.clip(pred[:, 3], 0.0, 1.0))
+        out_beat_pos.append(feats["beat_pos"])
+        out_beat_in_measure.append(feats["beat_in_measure"])
 
     return {
         "pitches": pitches,
@@ -227,6 +238,12 @@ def predict_raw(input_path, era, checkpoint_path="checkpoints/best.pt", device=N
         "log_ratio": np.concatenate(out_logratio),
         "velocity": np.concatenate(out_vel),
         "pedal": np.concatenate(out_pedal),
+        # score-derived per-note context, carried through for the post-processing
+        # levers in apply_adjustments (melody emphasis, chord roll, metric accent).
+        "voice_role": voice_role,        # 0 solo, 1 top, 2 bottom, 3 inner
+        "chord_size": chord_size,
+        "beat_pos": np.concatenate(out_beat_pos),                # subdivision within beat (0 = on the beat)
+        "beat_in_measure": np.concatenate(out_beat_in_measure),  # which beat of the measure (0 = downbeat)
         "grid_unit": grid_unit,
         "era": ERA_NAMES[era_id],
     }
@@ -248,7 +265,27 @@ def apply_adjustments(raw, params):
 
     vel = raw["velocity"]
     dynamics_intensity = params.get("dynamics_intensity", 1.0)
-    vel_adjusted = np.clip(vel.mean() + (vel - vel.mean()) * dynamics_intensity, 0.0, 1.0)
+    vel_adjusted = vel.mean() + (vel - vel.mean()) * dynamics_intensity
+
+    # melody emphasis: lift the top-of-chord voice and ease back the
+    # inner/bottom accompaniment so the tune sits above the texture.
+    melody_emphasis = params.get("melody_emphasis", 0.0)
+    if melody_emphasis:
+        voice_role = raw["voice_role"]
+        is_top = voice_role == 1
+        is_accomp = (voice_role == 2) | (voice_role == 3)
+        vel_adjusted = vel_adjusted + melody_emphasis * MELODY_EMPHASIS_TOP_GAIN * is_top
+        vel_adjusted = vel_adjusted - melody_emphasis * MELODY_EMPHASIS_ACCOMP_CUT * is_accomp
+
+    # metric accent: stress beat onsets, downbeats most of all.
+    metric_accent = params.get("metric_accent", 0.0)
+    if metric_accent:
+        on_beat = raw["beat_pos"] == 0
+        downbeat = on_beat & (raw["beat_in_measure"] == 0)
+        weight = np.where(downbeat, 1.0, np.where(on_beat, METRIC_ACCENT_WEAK_BEAT, 0.0))
+        vel_adjusted = vel_adjusted + metric_accent * METRIC_ACCENT_GAIN * weight
+
+    vel_adjusted = np.clip(vel_adjusted, 0.0, 1.0)
 
     pedal_adjusted = np.clip(
         raw["pedal"] * params.get("pedal_scale", 1.0) + params.get("pedal_boost", 0.0),
@@ -259,6 +296,29 @@ def apply_adjustments(raw, params):
 
     pred_starts = (raw["q_starts"] + timing_offset) / tempo_multiplier
     pred_ends = pred_starts + np.exp(log_ratio) * (raw["q_ends"] - raw["q_starts"]) / tempo_multiplier
+
+    # chord roll: stagger simultaneous chord onsets bottom-to-top for an
+    # arpeggiated, less mechanical attack. Notes sharing a quantized onset
+    # form a chord (they're consecutive, since input is start-sorted); the
+    # lowest pitch stays put and higher notes enter progressively later.
+    chord_roll = params.get("chord_roll", 0.0)
+    if chord_roll:
+        q_starts = raw["q_starts"]
+        chord_pitches = raw["pitches"]
+        delays = np.zeros(len(q_starts))
+        i, nq = 0, len(q_starts)
+        while i < nq:
+            j = i + 1
+            while j < nq and abs(q_starts[j] - q_starts[i]) < 1e-6:
+                j += 1
+            if j - i > 1:
+                grp = np.arange(i, j)
+                ranks = np.argsort(np.argsort(chord_pitches[grp]))  # 0 = lowest pitch
+                delays[grp] = chord_roll * CHORD_ROLL_SECONDS_PER_NOTE * ranks
+            i = j
+        pred_starts = pred_starts + delays
+        pred_ends = pred_ends + delays
+
     pred_velocities = np.clip(np.round(vel_adjusted * 127), 1, 127)
 
     out_pm = pretty_midi.PrettyMIDI()
