@@ -23,6 +23,10 @@ import torch
 from torch.utils.data import Dataset
 
 from normalize_midi import estimate_grid
+from score_features import (
+    CHORD_QUALITY_VOCAB, CHORD_ROOT_VOCAB, KEY_MODE_VOCAB, KEY_TONIC_VOCAB,
+    ROMAN_DEGREE_VOCAB, SCALE_DEGREE_VOCAB, compute_score_features,
+)
 
 PITCH_MIN, PITCH_MAX = 21, 108
 N_PITCHES = PITCH_MAX - PITCH_MIN + 1
@@ -42,8 +46,39 @@ DURATION_RATIO_EPS = 1e-3
 VELOCITY_SCALE = 127.0
 
 CACHE_FILENAME = "_note_cache.npz"
-CACHE_VERSION = 3  # bump when the cached fields change, to invalidate stale caches
+CACHE_VERSION = 5  # bump when the cached fields change, to invalidate stale caches
 SUSTAIN_CC = 64
+
+# Timing target (gen-3): local-tempo deviation = log(performed_IOI / score_IOI)
+# between consecutive distinct onsets. Unlike the old onset-minus-nearest-grid
+# offset (capped at +-half a grid step, which quantized phrase rubato out of the
+# target entirely), this is unbounded and accumulates, so sustained phrase
+# rubato lives in the target. Clipped to a sane band.
+MIN_LOG_IOI, MAX_LOG_IOI = math.log(0.25), math.log(4.0)
+
+# Per-target standardization stats (written by analyze_data.py) used to z-score
+# the four regression targets before the Gaussian-NLL head. Order is fixed.
+TARGET_STATS_PATH = os.path.join("paired_data", "target_stats.json")
+TARGET_ORDER = ["log_ioi_ratio", "log_dur_ratio", "velocity", "pedal"]
+N_TARGETS = len(TARGET_ORDER)
+
+# Supervised global style descriptors (gen-3): per-piece summary statistics of
+# the performance, fed to the decoder as conditioning. Observed at train time
+# (so they can't collapse like the old VAE latent); set by the user at
+# inference time -> the expressive control surface. Standardized via STYLE_STATS.
+STYLE_STATS_PATH = os.path.join("paired_data", "style_stats.json")
+STYLE_ORDER = ["rubato_magnitude", "dynamic_range", "articulation", "pedal_amount", "log_tempo"]
+N_STYLE = len(STYLE_ORDER)
+
+AUG_SEMITONES = 5  # transposition-augmentation range (train only), +-semitones
+
+# Score-derived feature vocab sizes (definitions live in score_features.py).
+N_KEY_TONIC = KEY_TONIC_VOCAB
+N_KEY_MODE = KEY_MODE_VOCAB
+N_SCALE_DEGREE = SCALE_DEGREE_VOCAB
+N_CHORD_ROOT = CHORD_ROOT_VOCAB
+N_CHORD_QUALITY = CHORD_QUALITY_VOCAB
+N_ROMAN_DEGREE = ROMAN_DEGREE_VOCAB
 
 MAESTRO_CSV_PATH = os.path.join("raw_midi", "maestro-v3.0.0", "maestro-v3.0.0.csv")
 
@@ -103,6 +138,40 @@ def _piece_dirs(root, split):
     return sorted(glob.glob(os.path.join(root, split, "*", "*")))
 
 
+_warned_missing_stats = False
+
+
+def load_target_stats(path=TARGET_STATS_PATH):
+    """Per-target (mean, std) arrays in TARGET_ORDER. Falls back to identity
+    (0, 1) with a one-time warning if analyze_data.py hasn't been run yet, so
+    the dataset is still usable for feature checks - but real training needs
+    the file present so targets are properly z-scored for the NLL."""
+    global _warned_missing_stats
+    if os.path.exists(path):
+        with open(path) as f:
+            stats = json.load(f)
+        mean = np.array([stats[t]["mean"] for t in TARGET_ORDER], dtype=np.float32)
+        std = np.array([stats[t]["std"] for t in TARGET_ORDER], dtype=np.float32)
+        return mean, std
+    if not _warned_missing_stats:
+        _warned_missing_stats = True
+        print(f"WARNING: {path} not found; targets will NOT be standardized. "
+              f"Run analyze_data.py before training.")
+    return np.zeros(N_TARGETS, dtype=np.float32), np.ones(N_TARGETS, dtype=np.float32)
+
+
+def load_style_stats(path=STYLE_STATS_PATH):
+    """Per-descriptor (mean, std) arrays in STYLE_ORDER for z-scoring the style
+    conditioning vector. Falls back to identity if not yet computed."""
+    if os.path.exists(path):
+        with open(path) as f:
+            stats = json.load(f)
+        mean = np.array([stats[s]["mean"] for s in STYLE_ORDER], dtype=np.float32)
+        std = np.array([stats[s]["std"] for s in STYLE_ORDER], dtype=np.float32)
+        return mean, std
+    return np.zeros(N_STYLE, dtype=np.float32), np.ones(N_STYLE, dtype=np.float32)
+
+
 def _compute_chord_features(starts, pitches, tol=CHORD_ONSET_TOL):
     """For each note: chord_size (how many notes share its onset) and
     voice_role (solo / top / bottom / inner within that chord)."""
@@ -150,6 +219,50 @@ def _compute_local_density(starts, grid_unit, lookback_beats=LOCAL_DENSITY_LOOKB
     return counts / lookback_beats
 
 
+def _compute_tempo_dev(starts, q_starts, eps=1e-6):
+    """Per-note local-tempo deviation = log(performed_IOI / score_IOI) between
+    consecutive distinct onsets. Notes sharing a quantized onset (a chord) form
+    one group and share its value; the first group is 0 (no predecessor).
+
+    Reconstruction (used at inference): perf_onset[g] = perf_onset[g-1] +
+    score_IOI[g] * exp(dev[g]). Because it accumulates, sustained phrase rubato
+    is preserved rather than quantized away."""
+    n = len(starts)
+    if n == 0:
+        return np.zeros(0, dtype=np.float32)
+    grp = np.zeros(n, dtype=np.int64)
+    grp[1:] = np.cumsum(np.diff(q_starts) > eps)
+    n_groups = int(grp[-1]) + 1
+
+    perf_on = np.zeros(n_groups)
+    cnt = np.zeros(n_groups)
+    np.add.at(perf_on, grp, starts)
+    np.add.at(cnt, grp, 1.0)
+    perf_on /= np.maximum(cnt, 1.0)
+    score_on = np.zeros(n_groups)
+    score_on[grp] = q_starts  # constant within a group
+
+    dev = np.zeros(n_groups)
+    if n_groups > 1:
+        ratio = np.maximum(np.diff(perf_on), eps) / np.maximum(np.diff(score_on), eps)
+        dev[1:] = np.clip(np.log(ratio), MIN_LOG_IOI, MAX_LOG_IOI)
+    return dev[grp].astype(np.float32)
+
+
+def _compute_style(tempo_dev, log_dur_ratio, velocity, pedal, grid_unit):
+    """Per-piece global style descriptors (STYLE_ORDER), summarizing how this
+    performance was played: tempo flexibility, dynamic range, articulation,
+    pedalling, and base tempo. Conditioning at train time, control knobs at
+    inference time."""
+    return np.array([
+        float(np.std(tempo_dev)),
+        float(np.std(velocity)),
+        float(np.mean(log_dur_ratio)),
+        float(np.mean(pedal)),
+        float(math.log(grid_unit)),
+    ], dtype=np.float32)
+
+
 def _load_piece_arrays(piece_dir):
     """Parse original.midi once and cache all derived per-note arrays plus
     piece-level scalars to disk as a small .npz. Subsequent calls for the
@@ -185,6 +298,23 @@ def _load_piece_arrays(piece_dir):
     else:
         numerator, denominator = 4, 4
 
+    # Harmonic / tonal-tension / phrase features, computed once per piece on the
+    # quantized score and cached. Same grid_steps the input features use, so the
+    # harmony lines up with the metric features the model also sees.
+    grid_feats = compute_input_features(pitches, starts, ends, grid_unit, phase, numerator)
+    score_feats = compute_score_features(
+        pitches, grid_feats["grid_steps"], grid_feats["end_grid_steps"],
+        SUBDIVISIONS_PER_BEAT, numerator,
+    )
+
+    # gen-3 timing target (local-tempo deviation) + per-piece style descriptors
+    tempo_dev = _compute_tempo_dev(starts, grid_feats["q_starts"])
+    score_dur = np.maximum(grid_feats["q_ends"] - grid_feats["q_starts"], DURATION_RATIO_EPS)
+    log_dur_ratio = np.log(np.maximum((ends - starts) / score_dur, DURATION_RATIO_EPS))
+    vel01 = velocities.astype(np.float64) / VELOCITY_SCALE
+    pedal01 = pedal_at_times(starts, pedal_times, pedal_values) / VELOCITY_SCALE
+    style = _compute_style(tempo_dev, log_dur_ratio, vel01, pedal01, grid_unit)
+
     data = dict(
         pitches=pitches, starts=starts, ends=ends, velocities=velocities,
         pedal_times=pedal_times, pedal_values=pedal_values,
@@ -193,7 +323,9 @@ def _load_piece_arrays(piece_dir):
         local_density=local_density,
         grid_unit=grid_unit, phase=phase,
         time_sig_numerator=numerator, time_sig_denominator=denominator,
+        tempo_dev=tempo_dev, style=style,
         cache_version=CACHE_VERSION,
+        **score_feats,
     )
     np.savez(cache_path, **data)
     return data
@@ -244,10 +376,11 @@ def compute_input_features(pitches, starts, ends, grid_unit, phase, beats_per_me
 
 class NoteRegressionDataset(Dataset):
     def __init__(self, root="paired_data", split="train", window_notes=192,
-                 stride=192, index_cache=True):
+                 stride=192, index_cache=True, augment=False):
         self.root = root
         self.split = split
         self.window_notes = window_notes
+        self.augment = augment
         self._cache = {}  # piece_dir -> arrays dict, populated lazily per process
 
         piece_dirs = _piece_dirs(root, split)
@@ -255,6 +388,8 @@ class NoteRegressionDataset(Dataset):
             raise ValueError(f"no pieces found under {root}/{split}")
 
         self.era_map = build_era_map(root)
+        self.target_mean, self.target_std = load_target_stats()
+        self.style_mean, self.style_std = load_style_stats()
 
         counts = self._load_or_build_note_counts(piece_dirs, index_cache)
 
@@ -309,10 +444,30 @@ class NoteRegressionDataset(Dataset):
         w_interval_next = p["interval_next"][start:end]
         w_local_density = p["local_density"][start:end]
 
+        w_tempo_dev = p["tempo_dev"][start:end]
+        sw = {f: p[f][start:end] for f in SCORE_FEATURE_FIELDS}  # harmonic/tension/phrase
+
+        # transposition augmentation (train only): shift pitch + the pitch-class
+        # categoricals; intervals / scale-degree / timing targets are invariant
+        t = 0
+        if self.augment and len(w_pitches):
+            lo = max(-AUG_SEMITONES, PITCH_MIN - int(w_pitches.min()))
+            hi = min(AUG_SEMITONES, PITCH_MAX - int(w_pitches.max()))
+            if hi >= lo:
+                t = int(np.random.randint(lo, hi + 1))
+        w_pitches = w_pitches + t
+        key_tonic = sw["key_tonic"].copy()
+        chord_root = sw["chord_root"].copy()
+        if t:
+            kk = key_tonic < 12
+            key_tonic[kk] = (key_tonic[kk] + t) % 12
+            cc = chord_root < 12
+            chord_root[cc] = (chord_root[cc] + t) % 12
+
         feats = compute_input_features(w_pitches, w_starts, w_ends, grid_unit, phase, beats_per_measure)
         q_starts, q_ends = feats["q_starts"], feats["q_ends"]
 
-        timing_offset = w_starts - q_starts
+        log_ioi_ratio = w_tempo_dev.astype(np.float32)
         ratio = (w_ends - w_starts) / np.maximum(q_ends - q_starts, DURATION_RATIO_EPS)
         log_dur_ratio = np.log(np.maximum(ratio, DURATION_RATIO_EPS))
         velocity = w_vels.astype(np.float32) / VELOCITY_SCALE
@@ -340,16 +495,44 @@ class NoteRegressionDataset(Dataset):
             "tempo_scalar": torch.from_numpy(tempo_scalar),
             "piece_position": torch.from_numpy(piece_position),
             "era": torch.from_numpy(era_id),
+            # score-derived categoricals (key_tonic / chord_root transposed above)
+            "key_tonic": torch.from_numpy(key_tonic.astype(np.int64)),
+            "key_mode": torch.from_numpy(sw["key_mode"].astype(np.int64)),
+            "scale_degree": torch.from_numpy(sw["scale_degree"].astype(np.int64)),
+            "chord_root": torch.from_numpy(chord_root.astype(np.int64)),
+            "chord_quality": torch.from_numpy(sw["chord_quality"].astype(np.int64)),
+            "roman_degree": torch.from_numpy(sw["roman_degree"].astype(np.int64)),
+            # score-derived continuous
+            "tension_diameter": torch.from_numpy(sw["tension_diameter"].astype(np.float32)),
+            "tension_strain": torch.from_numpy(sw["tension_strain"].astype(np.float32)),
+            "tension_momentum": torch.from_numpy(sw["tension_momentum"].astype(np.float32)),
+            "dissonance": torch.from_numpy(sw["dissonance"].astype(np.float32)),
+            "phrase_strength": torch.from_numpy(sw["phrase_strength"].astype(np.float32)),
+            "phrase_pos": torch.from_numpy(sw["phrase_pos"].astype(np.float32)),
+            "phrase_dist": torch.from_numpy(sw["phrase_dist"].astype(np.float32)),
         }
-        y = torch.from_numpy(
-            np.stack([timing_offset, log_dur_ratio, velocity, pedal], axis=-1).astype(np.float32)
-        )
+        style = (p["style"].astype(np.float32) - self.style_mean) / self.style_std
+        x["style"] = torch.from_numpy(style)  # per-sample (N_STYLE,), conditioning
+
+        targets = np.stack([log_ioi_ratio, log_dur_ratio, velocity, pedal], axis=-1).astype(np.float32)
+        targets = (targets - self.target_mean) / self.target_std  # z-score for the NLL head
+        y = torch.from_numpy(targets)
         return x, y
 
 
-LONG_FIELDS = ["pitch", "beat_pos", "bar_pos", "beat_in_measure", "measure_number", "voice_role", "era"]
+# per-note arrays produced by score_features and cached per piece
+SCORE_FEATURE_FIELDS = [
+    "key_tonic", "key_mode", "scale_degree", "chord_root", "chord_quality", "roman_degree",
+    "tension_diameter", "tension_strain", "tension_momentum", "dissonance",
+    "phrase_strength", "phrase_pos", "phrase_dist",
+]
+
+LONG_FIELDS = ["pitch", "beat_pos", "bar_pos", "beat_in_measure", "measure_number", "voice_role", "era",
+               "key_tonic", "key_mode", "scale_degree", "chord_root", "chord_quality", "roman_degree"]
 FLOAT_FIELDS = ["rel_step", "ioi", "dur_grid", "interval_prev", "interval_next",
-                 "chord_size", "local_density", "tempo_scalar", "piece_position"]
+                 "chord_size", "local_density", "tempo_scalar", "piece_position",
+                 "tension_diameter", "tension_strain", "tension_momentum", "dissonance",
+                 "phrase_strength", "phrase_pos", "phrase_dist"]
 
 
 def collate_fn(batch):
@@ -359,28 +542,55 @@ def collate_fn(batch):
 
     out = {f: torch.zeros(bsz, max_len, dtype=torch.long) for f in LONG_FIELDS}
     out.update({f: torch.zeros(bsz, max_len, dtype=torch.float) for f in FLOAT_FIELDS})
-    y = torch.zeros(bsz, max_len, 4, dtype=torch.float)
+    y = torch.zeros(bsz, max_len, N_TARGETS, dtype=torch.float)
+    style = torch.zeros(bsz, N_STYLE, dtype=torch.float)  # per-sample conditioning
     pad_mask = torch.ones(bsz, max_len, dtype=torch.bool)  # True = padding
 
     for i, (x, yi) in enumerate(batch):
         n = x["pitch"].shape[0]
         for f in LONG_FIELDS + FLOAT_FIELDS:
             out[f][i, :n] = x[f]
+        style[i] = x["style"]
         y[i, :n] = yi
         pad_mask[i, :n] = False
 
     out["y"] = y
+    out["style"] = style
     out["pad_mask"] = pad_mask
     return out
 
 
+def prebuild_caches(root="paired_data", splits=("train", "validation", "test")):
+    """Build (or refresh) every piece's _note_cache.npz up front, so the v4
+    harmonic features are computed once with a clean progress readout instead
+    of lazily - and racily - during the first training epoch's data loading."""
+    import time
+    t0 = time.time()
+    for split in splits:
+        dirs = _piece_dirs(root, split)
+        print(f"[{split}] {len(dirs)} pieces")
+        for i, d in enumerate(dirs):
+            try:
+                _load_piece_arrays(d)
+            except Exception as e:
+                print(f"  FAILED {d}: {e.__class__.__name__}: {e}")
+            if i % 50 == 0:
+                print(f"  {split} {i}/{len(dirs)} | {time.time() - t0:.0f}s")
+    print(f"done in {time.time() - t0:.0f}s")
+
+
 if __name__ == "__main__":
-    from torch.utils.data import DataLoader
+    import sys
 
-    ds = NoteRegressionDataset(split="validation", window_notes=192, stride=192)
-    print(f"validation windows: {len(ds)}")
+    if len(sys.argv) > 1 and sys.argv[1] == "prebuild":
+        prebuild_caches()
+    else:
+        from torch.utils.data import DataLoader
 
-    dl = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=collate_fn)
-    batch = next(iter(dl))
-    for k, v in batch.items():
-        print(k, v.shape, v.dtype)
+        ds = NoteRegressionDataset(split="validation", window_notes=192, stride=192)
+        print(f"validation windows: {len(ds)}")
+
+        dl = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=collate_fn)
+        batch = next(iter(dl))
+        for k, v in batch.items():
+            print(k, v.shape, v.dtype)

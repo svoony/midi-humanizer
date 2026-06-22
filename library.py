@@ -216,7 +216,7 @@ def _interleave_by_source(entries):
     return out
 
 
-def search(query, limit=120):
+def search(query, limit=5000):  # high cap: the sidebar shows the whole library
     index = build_index()
     query = (query or "").strip().lower()
     if not query:

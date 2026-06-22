@@ -25,20 +25,21 @@ import numpy as np
 import pretty_midi
 import torch
 
-from model import PerformanceRegressor
+from model import PerformanceNet
 from normalize_midi import estimate_grid, quantize_time
 from note_dataset import (
-    ERA_NAMES, FLOAT_FIELDS, LONG_FIELDS, SUBDIVISIONS_PER_BEAT,
-    _compute_chord_features, _compute_local_density, _compute_melodic_intervals,
-    compute_input_features,
+    ERA_NAMES, FLOAT_FIELDS, LONG_FIELDS, N_STYLE, SCORE_FEATURE_FIELDS,
+    SUBDIVISIONS_PER_BEAT, _compute_chord_features, _compute_local_density,
+    _compute_melodic_intervals, compute_input_features,
 )
+from score_features import compute_score_features
 
 MUSICXML_EXTENSIONS = (".musicxml", ".xml", ".mxl")
 DEFAULT_TEMPO_BPM = 120.0
 
 WINDOW_NOTES = 192  # matches the training window size
-MAX_TIMING_OFFSET_GRID_UNITS = 2.0
 MIN_LOG_RATIO, MAX_LOG_RATIO = np.log(0.1), np.log(10.0)
+ONSET_LEAK = 0.05  # leaky-anchor strength when integrating local tempo -> onsets
 SUSTAIN_CC = 64
 
 # scale factors mapping the 0..~2 user knobs to musically reasonable amounts
@@ -53,14 +54,52 @@ _model_cache = {}
 
 
 def _load_model(checkpoint_path, device):
+    """Loads PerformanceNet plus the target + style standardization stats (the
+    model predicts in z-scored space and is conditioned on a z-scored style
+    vector)."""
     key = (checkpoint_path, device)
     if key not in _model_cache:
-        model = PerformanceRegressor().to(device)
-        ckpt = torch.load(checkpoint_path, map_location=device)
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        model = PerformanceNet(**ckpt.get("config", {})).to(device)
         model.load_state_dict(ckpt["model"])
         model.eval()
-        _model_cache[key] = model
+        stats = {
+            "target_mean": np.asarray(ckpt["target_mean"], dtype=np.float32),
+            "target_std": np.asarray(ckpt["target_std"], dtype=np.float32),
+            "style_mean": np.asarray(ckpt["style_mean"], dtype=np.float32),
+            "style_std": np.asarray(ckpt["style_std"], dtype=np.float32),
+        }
+        _model_cache[key] = (model, stats)
     return _model_cache[key]
+
+
+def reconstruct_onsets(q_starts, log_ioi_ratio, leak=ONSET_LEAK):
+    """Turn per-note local-tempo deviations into absolute onsets by leaky
+    integration anchored to the constant-tempo grid. Pure cumulative integration
+    would drift (clipped pauses, prediction error); the gentle pull toward
+    q_starts keeps global timing sane while preserving phrase-level rubato.
+    Notes sharing a quantized onset (a chord) share the reconstructed onset."""
+    n = len(q_starts)
+    if n == 0:
+        return np.zeros(0)
+    grp = np.zeros(n, dtype=np.int64)
+    grp[1:] = np.cumsum(np.diff(q_starts) > 1e-6)
+    n_groups = int(grp[-1]) + 1
+    score_on = np.zeros(n_groups)
+    score_on[grp] = q_starts
+    dev = np.zeros(n_groups)
+    cnt = np.zeros(n_groups)
+    np.add.at(dev, grp, log_ioi_ratio)
+    np.add.at(cnt, grp, 1.0)
+    dev /= np.maximum(cnt, 1.0)
+
+    recon = np.zeros(n_groups)
+    recon[0] = score_on[0]
+    for g in range(1, n_groups):
+        score_ioi = score_on[g] - score_on[g - 1]
+        free = recon[g - 1] + score_ioi * math.exp(dev[g])
+        recon[g] = (1.0 - leak) * free + leak * score_on[g]
+    return recon[grp]
 
 
 CONSTANT_VELOCITY = 80
@@ -163,10 +202,15 @@ def normalize_to_flat_midi(input_path):
     return out_pm
 
 
-def predict_raw(input_path, era, checkpoint_path="checkpoints/best.pt", device=None):
+def predict_raw(input_path, era, checkpoint_path="checkpoints/best.pt", device=None, style_z=None):
     """Returns a dict of per-note arrays: pitches, q_starts, q_ends,
-    timing_offset, log_ratio, velocity (0-1), pedal (0-1) - the model's raw,
-    unadjusted predictions."""
+    log_ioi_ratio (local-tempo deviation), log_ratio (duration), velocity
+    (0-1), pedal (0-1) - the model's raw predictions.
+
+    style_z is the standardized global style vector (shape (N_STYLE,)): 0 =
+    neutral / dataset-average interpretation; raise rubato_magnitude or
+    dynamic_range above 0 for a more expressive, committed render. None ->
+    neutral."""
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     era_id = ERA_NAMES.index(era) if isinstance(era, str) else era
 
@@ -177,7 +221,19 @@ def predict_raw(input_path, era, checkpoint_path="checkpoints/best.pt", device=N
     interval_prev, interval_next = _compute_melodic_intervals(pitches)
     local_density = _compute_local_density(starts, grid_unit)
 
-    model = _load_model(checkpoint_path, device)
+    # harmonic / tension / phrase features over the whole piece (same as the
+    # training cache), then sliced per chunk below
+    piece_feats = compute_input_features(pitches, starts, ends, grid_unit, phase, beats_per_measure)
+    score_feats = compute_score_features(
+        pitches, piece_feats["grid_steps"], piece_feats["end_grid_steps"],
+        SUBDIVISIONS_PER_BEAT, beats_per_measure,
+    )
+
+    model, stats = _load_model(checkpoint_path, device)
+    target_mean, target_std = stats["target_mean"], stats["target_std"]
+    if style_z is None:
+        style_z = np.zeros(N_STYLE, dtype=np.float32)
+    style_t = torch.from_numpy(np.asarray(style_z, dtype=np.float32)).unsqueeze(0).to(device)
 
     n_total = len(pitches)
     out_q_starts, out_q_ends, out_timing, out_logratio, out_vel, out_pedal = [], [], [], [], [], []
@@ -210,16 +266,20 @@ def predict_raw(input_path, era, checkpoint_path="checkpoints/best.pt", device=N
             "piece_position": (c_starts / piece_duration).astype(np.float32),
             "era": np.full(n, era_id, dtype=np.int64),
         }
+        # score-derived categoricals + continuous, sliced from the whole-piece pass
+        for f in SCORE_FEATURE_FIELDS:
+            field_arrays[f] = score_feats[f][chunk_start:chunk_end]
 
         x = {}
         for f in LONG_FIELDS:
-            x[f] = torch.from_numpy(field_arrays[f]).unsqueeze(0).to(device)
+            x[f] = torch.from_numpy(field_arrays[f].astype(np.int64)).unsqueeze(0).to(device)
         for f in FLOAT_FIELDS:
-            x[f] = torch.from_numpy(field_arrays[f]).unsqueeze(0).to(device)
+            x[f] = torch.from_numpy(field_arrays[f].astype(np.float32)).unsqueeze(0).to(device)
         x["pad_mask"] = torch.zeros(1, n, dtype=torch.bool).to(device)
 
-        with torch.no_grad():
-            pred = model(x)[0].cpu().numpy()
+        mean, _logvar = model.predict(x, style=style_t)
+        # model predicts in standardized space; invert to real target units
+        pred = mean[0].cpu().numpy() * target_std + target_mean
 
         out_q_starts.append(feats["q_starts"])
         out_q_ends.append(feats["q_ends"])
@@ -234,7 +294,7 @@ def predict_raw(input_path, era, checkpoint_path="checkpoints/best.pt", device=N
         "pitches": pitches,
         "q_starts": np.concatenate(out_q_starts),
         "q_ends": np.concatenate(out_q_ends),
-        "timing_offset": np.concatenate(out_timing),
+        "log_ioi_ratio": np.concatenate(out_timing),
         "log_ratio": np.concatenate(out_logratio),
         "velocity": np.concatenate(out_vel),
         "pedal": np.concatenate(out_pedal),
@@ -254,9 +314,10 @@ def apply_adjustments(raw, params):
     controllable knobs and renders the final MIDI. No model forward pass."""
     grid_unit = raw["grid_unit"]
 
-    timing_offset = np.clip(
-        raw["timing_offset"] * params.get("rubato_intensity", 1.0),
-        -MAX_TIMING_OFFSET_GRID_UNITS * grid_unit, MAX_TIMING_OFFSET_GRID_UNITS * grid_unit,
+    # rubato lever scales the predicted local-tempo deviation (in log space, so
+    # it amplifies/suppresses how much the tempo ebbs and flows)
+    log_ioi_ratio = np.clip(
+        raw["log_ioi_ratio"] * params.get("rubato_intensity", 1.0), np.log(0.2), np.log(5.0),
     )
     log_ratio = np.clip(
         raw["log_ratio"] * params.get("articulation_intensity", 1.0),
@@ -294,8 +355,11 @@ def apply_adjustments(raw, params):
 
     tempo_multiplier = max(params.get("tempo_multiplier", 1.0), 0.1)
 
-    pred_starts = (raw["q_starts"] + timing_offset) / tempo_multiplier
-    pred_ends = pred_starts + np.exp(log_ratio) * (raw["q_ends"] - raw["q_starts"]) / tempo_multiplier
+    # reconstruct onsets from the (lever-scaled) local-tempo curve, anchored to
+    # the grid, then apply the global tempo multiplier
+    pred_starts = reconstruct_onsets(raw["q_starts"], log_ioi_ratio) / tempo_multiplier
+    score_dur = np.maximum(raw["q_ends"] - raw["q_starts"], 1e-4)
+    pred_ends = pred_starts + np.exp(log_ratio) * score_dur / tempo_multiplier
 
     # chord roll: stagger simultaneous chord onsets bottom-to-top for an
     # arpeggiated, less mechanical attack. Notes sharing a quantized onset

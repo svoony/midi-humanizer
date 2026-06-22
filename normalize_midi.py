@@ -11,9 +11,26 @@ CONSTANT_VELOCITY = 80
 SUBDIVISIONS_PER_BEAT = 4  # 16th-note grid
 PHASE_SEARCH_STEPS = 200
 
+# pretty_midi.estimate_tempo systematically returns an octave (2x/4x) too fast
+# on dense piano writing - e.g. 239 bpm on Liszt's Liebestraum, ~4x the real
+# beat - which misaligns the metric grid and corrupts the timing target. Fold
+# the estimate into a perceptually central one-octave band [60, 120) bpm.
+TEMPO_FOLD_MIN = 60.0
+TEMPO_FOLD_MAX = 120.0
+
+
+def fold_tempo(tempo):
+    if tempo <= 0:
+        return TEMPO_FOLD_MIN
+    while tempo >= TEMPO_FOLD_MAX:
+        tempo /= 2.0
+    while tempo < TEMPO_FOLD_MIN:
+        tempo *= 2.0
+    return tempo
+
 
 def estimate_grid(pm):
-    tempo = pm.estimate_tempo()
+    tempo = fold_tempo(pm.estimate_tempo())
     beat_duration = 60.0 / tempo
     grid_unit = beat_duration / SUBDIVISIONS_PER_BEAT
 

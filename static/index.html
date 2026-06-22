@@ -7,27 +7,44 @@
 <style>
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    max-width: 640px;
-    margin: 3rem auto;
-    padding: 0 1.5rem;
+    margin: 0;
     color: #222;
     background: #fff;
   }
-  h1 { font-size: 20px; font-weight: 600; margin-bottom: 0.25rem; }
+  .app-layout { display: flex; height: 100vh; overflow: hidden; }
+  #librarySidebar {
+    width: 38%;
+    min-width: 300px;
+    max-width: 460px;
+    height: 100vh;
+    box-sizing: border-box;
+    border-right: 1px solid #eee;
+    background: #fafafb;
+    display: flex;
+    flex-direction: column;
+    padding: 1rem 1rem 0.75rem;
+  }
+  .sidebarTitle { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #888; margin: 0 0 0.6rem; }
+  #mainContent { flex: 1; height: 100vh; overflow-y: auto; box-sizing: border-box; padding: 2.5rem 2rem; }
+  .mainInner { max-width: 640px; }
+  h1 { font-size: 20px; font-weight: 600; margin-bottom: 0.25rem; margin-top: 0; }
   p.sub { color: #666; margin-top: 0; margin-bottom: 2rem; font-size: 14px; }
 
   #dropzone {
     border: 2px dashed #bbb;
-    border-radius: 12px;
-    padding: 3rem 1.5rem;
+    border-radius: 10px;
+    padding: 0.9rem 0.75rem;
     text-align: center;
     color: #888;
+    font-size: 12px;
     cursor: pointer;
     transition: border-color 0.15s, background 0.15s;
   }
   #dropzone.dragover { border-color: #5a67d8; background: #f5f6ff; color: #5a67d8; }
-  #dropzone p { margin: 0.3rem 0; }
+  #dropzone p { margin: 0.2rem 0; }
   #dropzone .filename { font-weight: 600; color: #333; }
+  #sidebarUpload { flex-shrink: 0; margin-top: 8px; }
+  .sidebarUploadLabel { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: #999; margin-bottom: 6px; }
 
   .controls {
     display: flex;
@@ -157,25 +174,6 @@
 
   .pedalNote { font-size: 11px; color: #888; margin-top: 6px; }
 
-  #libraryToggle {
-    background: none;
-    border: none;
-    color: #5a67d8;
-    font-size: 13px;
-    cursor: pointer;
-    padding: 0;
-    margin-bottom: 0.75rem;
-  }
-  #libraryToggle:hover { text-decoration: underline; }
-
-  #libraryPanel {
-    display: none;
-    border: 1px solid #e3e3e8;
-    border-radius: 10px;
-    padding: 12px;
-    margin-bottom: 1.25rem;
-  }
-  #libraryPanel.open { display: block; }
   #librarySearch {
     width: 100%;
     box-sizing: border-box;
@@ -186,9 +184,10 @@
   }
   #libraryResults {
     list-style: none;
-    margin: 10px 0 0;
+    margin: 8px 0 0;
     padding: 0;
-    max-height: 280px;
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
   }
   #libraryResults li {
@@ -197,12 +196,21 @@
     border-radius: 6px;
     font-size: 13px;
     display: flex;
-    justify-content: space-between;
-    gap: 8px;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 6px;
+    overflow: hidden;
   }
   #libraryResults li:hover { background: #f5f6ff; }
-  #libraryResults .libComposer { font-weight: 600; color: #333; }
-  #libraryResults .libTitle { color: #555; flex: 1; }
+  #libraryResults .libComposer { font-weight: 600; color: #333; flex-shrink: 0; }
+  #libraryResults .libTitle {
+    color: #555;
+    flex: 0 1 auto;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   #libraryResults .libSource { font-size: 11px; color: #999; text-transform: uppercase; letter-spacing: 0.03em; flex-shrink: 0; }
   #libraryResults .libEra {
     font-size: 10px;
@@ -212,7 +220,6 @@
     padding: 2px 7px;
     border-radius: 10px;
     flex-shrink: 0;
-    align-self: center;
   }
   .era-baroque  { background: #f3e9d2; color: #8a6d3b; }
   .era-classical { background: #e1ecf2; color: #31708f; }
@@ -232,16 +239,10 @@
 </head>
 <body>
 
-<h1>midi-transformer</h1>
-<p class="sub">Drop in a flat/quantized MIDI or MusicXML file and render it as an expressive performance. MusicXML is recommended for unreliable downloaded MIDI files - it carries exact pitch/rhythm data instead of relying on tempo estimation.</p>
+<div class="app-layout">
 
-<div class="controls">
-  <label for="eraSelect">Style era</label>
-  <select id="eraSelect"></select>
-</div>
-
-<button id="libraryToggle" type="button">Browse library (ASAP / KernScores / piano-midi.de)</button>
-<div id="libraryPanel">
+<aside id="librarySidebar">
+  <div class="sidebarTitle">Library</div>
   <input type="text" id="librarySearch" placeholder="Search by composer or title (e.g. \"beethoven sonata\")">
   <ul id="libraryResults"></ul>
   <div id="libraryAttribution">
@@ -249,13 +250,26 @@
     <a href="https://creativecommons.org/licenses/by-sa/3.0/de/deed.en" target="_blank" rel="noopener">CC BY-SA 3.0 DE</a>
     &mdash; source: <a href="http://www.piano-midi.de" target="_blank" rel="noopener">piano-midi.de</a>
   </div>
-</div>
+  <div id="sidebarUpload">
+    <div class="sidebarUploadLabel">Or use your own file</div>
+    <div id="dropzone">
+      <p>Drop a .mid / .musicxml here, or click to browse</p>
+      <p class="filename" id="filename"></p>
+    </div>
+    <input type="file" id="fileInput" accept=".mid,.midi,.musicxml,.xml,.mxl" style="display:none">
+  </div>
+</aside>
 
-<div id="dropzone">
-  <p>Drag and drop a .mid or .musicxml file here, or click to browse</p>
-  <p class="filename" id="filename"></p>
+<main id="mainContent">
+<div class="mainInner">
+
+<h1>midi-transformer</h1>
+<p class="sub">Pick a piece from the library on the left, or drop in your own file, and render it as an expressive performance. MusicXML is recommended for unreliable downloaded MIDI files - it carries exact pitch/rhythm data instead of relying on tempo estimation.</p>
+
+<div class="controls">
+  <label for="eraSelect">Style era</label>
+  <select id="eraSelect"></select>
 </div>
-<input type="file" id="fileInput" accept=".mid,.midi,.musicxml,.xml,.mxl" style="display:none">
 
 <div id="status"></div>
 
@@ -287,6 +301,10 @@
   <div class="progressBar" id="chatProgress"><div class="progressBarInner"></div></div>
 </div>
 
+</div><!-- /mainInner -->
+</main>
+</div><!-- /app-layout -->
+
 <script>
 const dropzone = document.getElementById('dropzone');
 const fileInput = document.getElementById('fileInput');
@@ -306,8 +324,6 @@ const chatSend = document.getElementById('chatSend');
 const chatProgress = document.getElementById('chatProgress');
 const normalizedResultEl = document.getElementById('normalizedResult');
 const normalizedPlayer = document.getElementById('normalizedPlayer');
-const libraryToggle = document.getElementById('libraryToggle');
-const libraryPanel = document.getElementById('libraryPanel');
 const librarySearch = document.getElementById('librarySearch');
 const libraryResults = document.getElementById('libraryResults');
 
@@ -330,12 +346,8 @@ eraSelect.addEventListener('change', () => {
   renderCurrent();
 });
 
-libraryToggle.addEventListener('click', () => {
-  libraryPanel.classList.toggle('open');
-  if (libraryPanel.classList.contains('open') && !libraryResults.dataset.loaded) {
-    runLibrarySearch('');
-  }
-});
+// the sidebar is always visible, so load the whole library on startup
+runLibrarySearch('');
 
 let librarySearchDebounce = null;
 librarySearch.addEventListener('input', () => {
@@ -362,6 +374,8 @@ function renderLibraryResults(items) {
   }
   for (const item of items) {
     const li = document.createElement('li');
+    // native tooltip shows the full name when a long title is ellipsized
+    li.title = `${item.composer} - ${item.title}`;
     li.innerHTML = `<span class="libComposer">${escapeHtml(item.composer)}</span> ` +
       `<span class="libTitle">${escapeHtml(item.title)}</span>` +
       `<span class="libEra era-${escapeHtml(item.era)}">${escapeHtml(item.era)}</span>` +

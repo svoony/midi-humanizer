@@ -1,94 +1,82 @@
 """
-Characterize the train split to ground normalization constants and head
-design for the note-wise performance-regression model: how big are timing
-offsets (rubato), duration ratios (articulation), and what's the velocity
-range and notes-per-piece distribution.
+Compute the standardization stats the gen-3 model needs, from the per-piece
+caches (so run note_dataset.py prebuild first):
+
+  paired_data/target_stats.json - per-target (mean, std) in TARGET_ORDER, where
+      the timing target is now the local-tempo deviation log(perf_IOI/score_IOI).
+  paired_data/style_stats.json  - per-descriptor (mean, std) in STYLE_ORDER for
+      the global style conditioning vector.
+
+Both are computed over the train split only.
 """
 import glob
+import json
 import os
 
 import numpy as np
-import pretty_midi
 
-from normalize_midi import quantize_time, estimate_grid
+from note_dataset import (
+    DURATION_RATIO_EPS, STYLE_ORDER, STYLE_STATS_PATH, TARGET_ORDER,
+    TARGET_STATS_PATH, VELOCITY_SCALE, _load_piece_arrays, compute_input_features,
+    pedal_at_times,
+)
 
 ROOT = "paired_data/train"
 
 
-def percentiles(arr, ps=(1, 5, 25, 50, 75, 95, 99)):
-    return {p: round(float(np.percentile(arr, p)), 4) for p in ps}
+def _stat(arr):
+    return {"mean": float(np.mean(arr)), "std": float(max(np.std(arr), 1e-4))}
 
 
 def main():
-    piece_dirs = sorted(glob.glob(os.path.join(ROOT, "*", "*")))
-    print(f"analyzing {len(piece_dirs)} train pieces")
+    dirs = sorted(glob.glob(os.path.join(ROOT, "*", "*")))
+    print(f"computing stats over {len(dirs)} train pieces")
 
-    timing_offsets = []
-    duration_ratios = []
-    velocities = []
-    note_counts = []
-    grid_units = []
-
-    for i, piece_dir in enumerate(piece_dirs):
-        pm = pretty_midi.PrettyMIDI(os.path.join(piece_dir, "original.midi"))
-        notes = sorted(pm.instruments[0].notes, key=lambda n: n.start)
-        note_counts.append(len(notes))
-        if not notes:
+    tempo_dev, log_dur, vel, ped, styles = [], [], [], [], []
+    for i, d in enumerate(dirs):
+        p = _load_piece_arrays(d)
+        if len(p["pitches"]) == 0:
             continue
+        feats = compute_input_features(
+            p["pitches"], p["starts"], p["ends"],
+            float(p["grid_unit"]), float(p["phase"]), int(p["time_sig_numerator"]),
+        )
+        score_dur = np.maximum(feats["q_ends"] - feats["q_starts"], DURATION_RATIO_EPS)
+        ldr = np.log(np.maximum((p["ends"] - p["starts"]) / score_dur, DURATION_RATIO_EPS))
 
-        grid_unit, phase = estimate_grid(pm)
-        grid_units.append(grid_unit)
-
-        for n in notes:
-            q_start = quantize_time(n.start, grid_unit, phase)
-            q_end = quantize_time(n.end, grid_unit, phase)
-            if q_end <= q_start:
-                q_end = q_start + grid_unit
-
-            timing_offsets.append(n.start - q_start)
-            duration_ratios.append((n.end - n.start) / (q_end - q_start))
-            velocities.append(n.velocity)
-
+        tempo_dev.append(p["tempo_dev"])
+        log_dur.append(ldr)
+        vel.append(p["velocities"].astype(np.float64) / VELOCITY_SCALE)
+        ped.append(pedal_at_times(p["starts"], p["pedal_times"], p["pedal_values"]) / VELOCITY_SCALE)
+        styles.append(p["style"])
         if i % 200 == 0:
-            print(f"{i}/{len(piece_dirs)}")
+            print(f"  {i}/{len(dirs)}")
 
-    timing_offsets = np.array(timing_offsets)
-    duration_ratios = np.array(duration_ratios)
-    velocities = np.array(velocities)
-    note_counts = np.array(note_counts)
-    grid_units = np.array(grid_units)
+    tempo_dev = np.concatenate(tempo_dev)
+    log_dur = np.concatenate(log_dur)
+    vel = np.concatenate(vel)
+    ped = np.concatenate(ped)
+    styles = np.stack(styles)  # (n_pieces, N_STYLE)
 
-    print("\n=== timing_offset (seconds, performed - quantized onset) ===")
-    print("mean", round(float(timing_offsets.mean()), 4), "std", round(float(timing_offsets.std()), 4))
-    print(percentiles(timing_offsets))
+    per_target = [tempo_dev, log_dur, vel, ped]
+    target_stats = {"order": TARGET_ORDER}
+    for name, arr in zip(TARGET_ORDER, per_target):
+        target_stats[name] = _stat(arr)
+    with open(TARGET_STATS_PATH, "w") as f:
+        json.dump(target_stats, f, indent=2)
 
-    print("\n=== duration_ratio (performed_dur / quantized_dur) ===")
-    print("mean", round(float(duration_ratios.mean()), 4), "std", round(float(duration_ratios.std()), 4))
-    print(percentiles(duration_ratios))
+    style_stats = {"order": STYLE_ORDER}
+    for j, name in enumerate(STYLE_ORDER):
+        style_stats[name] = _stat(styles[:, j])
+    with open(STYLE_STATS_PATH, "w") as f:
+        json.dump(style_stats, f, indent=2)
 
-    print("\n=== velocity (raw, 0-127) ===")
-    print("mean", round(float(velocities.mean()), 2), "std", round(float(velocities.std()), 2))
-    print(percentiles(velocities, ps=(1, 5, 25, 50, 75, 95, 99)))
-    print("min/max", int(velocities.min()), int(velocities.max()))
-
-    print("\n=== notes per piece ===")
-    print("mean", round(float(note_counts.mean()), 1), "median", int(np.median(note_counts)))
-    print(percentiles(note_counts))
-    print("min/max", int(note_counts.min()), int(note_counts.max()))
-
-    print("\n=== estimated grid_unit (seconds, i.e. 16th-note length) ===")
-    print("mean", round(float(grid_units.mean()), 4))
-    print(percentiles(grid_units))
-
-    np.savez(
-        "data_stats.npz",
-        timing_offsets=timing_offsets,
-        duration_ratios=duration_ratios,
-        velocities=velocities,
-        note_counts=note_counts,
-        grid_units=grid_units,
-    )
-    print("\nsaved raw arrays to data_stats.npz")
+    print(f"\n=== target stats -> {TARGET_STATS_PATH} ===")
+    for name in TARGET_ORDER:
+        print(f"  {name:14s} mean {target_stats[name]['mean']:+.5f}  std {target_stats[name]['std']:.5f}")
+    print(f"\n=== style stats -> {STYLE_STATS_PATH} ===")
+    for name in STYLE_ORDER:
+        print(f"  {name:16s} mean {style_stats[name]['mean']:+.5f}  std {style_stats[name]['std']:.5f}")
 
 
 if __name__ == "__main__":
